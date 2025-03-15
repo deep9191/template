@@ -115,3 +115,106 @@ steps:
         });
         console.log('Issue closed');
 ```
+==================================================================================
+
+```yaml
+
+name: Cross-Org Member Management
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  manage-member:
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.labels.*.name, 'member-management')
+    
+    env:
+      DIGITAL_ORG: digital-org-name  # Replace with your digital org name
+    
+    steps:
+      - name: Install GitHub CLI
+        run: |
+          type -p curl >/dev/null || (apt update && apt install curl -y)
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+          && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+          && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+          && apt update \
+          && apt install gh -y
+
+      - name: Setup GitHub App Authentication
+        id: setup-app
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+          PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          echo "$PRIVATE_KEY" > private-key.pem
+          TOKEN=$(gh auth login --with-token <<< $(gh api --method POST -H "Accept: application/vnd.github+json" \
+            /app/installations/${{ secrets.APP_INSTALLATION_ID }}/access_tokens \
+            --app $APP_ID \
+            --key private-key.pem | jq -r .token))
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          rm private-key.pem
+
+      - name: Parse Issue and Process Request
+        env:
+          GH_TOKEN: ${{ steps.setup-app.outputs.token }}
+        run: |
+          # Parse issue body
+          ISSUE_BODY=$(gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }} --jq .body)
+          
+          # Extract action and username
+          ACTION=$(echo "$ISSUE_BODY" | grep -A1 "### Action" | tail -n1 | xargs)
+          USERNAME=$(echo "$ISSUE_BODY" | grep -A1 "### GitHub Username" | tail -n1 | xargs)
+          
+          echo "Processing action: $ACTION for user: $USERNAME"
+          
+          # Set up error handling
+          set +e  # Don't exit on error
+          
+          # Process based on action
+          case "$ACTION" in
+            "Add member")
+              gh api --method POST /orgs/$DIGITAL_ORG/invitations \
+                -f email="" -f role="direct_member" -f username="$USERNAME"
+              ;;
+              
+            "Remove member")
+              gh api --method DELETE /orgs/$DIGITAL_ORG/members/$USERNAME
+              ;;
+              
+            "Make owner")
+              gh api --method PUT /orgs/$DIGITAL_ORG/memberships/$USERNAME \
+                -f role="admin"
+              ;;
+              
+            "Remove owner")
+              gh api --method PUT /orgs/$DIGITAL_ORG/memberships/$USERNAME \
+                -f role="member"
+              ;;
+          esac
+          
+          # Capture exit code but don't fail
+          EXIT_CODE=$?
+          
+          # Add comment based on result
+          if [ $EXIT_CODE -eq 0 ]; then
+            gh issue comment ${{ github.event.issue.number }} --body "✅ Action completed successfully:
+            - Action: $ACTION
+            - User: @$USERNAME
+            - Organization: $DIGITAL_ORG"
+          else
+            gh issue comment ${{ github.event.issue.number }} --body "⚠️ Action may have encountered issues:
+            - Action: $ACTION
+            - User: @$USERNAME
+            - Organization: $DIGITAL_ORG
+            - Note: The action was attempted but may not have completed successfully."
+          fi
+          
+          # Always close the issue
+          gh issue close ${{ github.event.issue.number }}
+          
+          # Always exit successfully
+          exit 0
+```
