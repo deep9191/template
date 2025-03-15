@@ -1,1 +1,141 @@
-# template
+name: Cross-Org Member Management
+description: Manage members in Digital Organization
+title: "[Member]: "
+labels: ["member-management"]
+
+body:
+  - type: dropdown
+    id: action
+    attributes:
+      label: Action
+      options:
+        - Add member
+        - Remove member
+        - Make owner
+        - Remove owner
+    validations:
+      required: true
+
+  - type: input
+    id: username
+    attributes:
+      label: GitHub Username
+      placeholder: octocat
+    validations:
+      required: true
+
+  - type: dropdown
+    id: target-org
+    attributes:
+      label: Target Organization
+      description: Organization where the action should be performed
+      options:
+        - digital-org-name  # Replace with your actual digital org name
+    validations:
+      required: true
+
+
+    ==================================================================================
+
+    name: Cross-Org Member Management
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  manage-member:
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.labels.*.name, 'member-management')
+    
+    env:
+      DIGITAL_ORG: digital-org-name  # Replace with your digital org name
+
+    steps:
+      - name: Verify Admin Access
+        uses: actions/github-script@v7
+        id: check_permission
+        with:
+          github-token: ${{ secrets.DIGITAL_ORG_TOKEN }}
+          script: |
+            try {
+              const { data } = await github.rest.orgs.getMembershipForUser({
+                org: process.env.DIGITAL_ORG,
+                username: context.actor
+              });
+              
+              if (data.role !== 'admin') {
+                throw new Error('You need admin permissions in the digital organization');
+              }
+              return 'authorized';
+            } catch (error) {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body: '❌ Error: You do not have admin permissions in the target organization'
+              });
+              throw error;
+            }
+
+      - name: Manage Organization Member
+        if: steps.check_permission.outputs.result == 'authorized'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DIGITAL_ORG_TOKEN }}
+          script: |
+            const issue = context.payload.issue;
+            const action = issue.body.match(/### Action\s*([^\n]+)/)[1].trim();
+            const username = issue.body.match(/### GitHub Username\s*([^\n]+)/)[1].trim();
+            
+            try {
+              switch(action) {
+                case 'Add member':
+                  await github.rest.orgs.setMembershipForUser({
+                    org: process.env.DIGITAL_ORG,
+                    username: username,
+                    role: 'member'
+                  });
+                  break;
+                  
+                case 'Remove member':
+                  await github.rest.orgs.removeMembershipForUser({
+                    org: process.env.DIGITAL_ORG,
+                    username: username
+                  });
+                  break;
+                  
+                case 'Make owner':
+                  await github.rest.orgs.setMembershipForUser({
+                    org: process.env.DIGITAL_ORG,
+                    username: username,
+                    role: 'admin'
+                  });
+                  break;
+                  
+                case 'Remove owner':
+                  await github.rest.orgs.setMembershipForUser({
+                    org: process.env.DIGITAL_ORG,
+                    username: username,
+                    role: 'member'
+                  });
+                  break;
+              }
+              
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body: `✅ Successfully completed: ${action} for @${username} in ${process.env.DIGITAL_ORG}`
+              });
+              
+              await github.rest.issues.update({
+                ...context.repo,
+                issue_number: context.issue.number,
+                state: 'closed'
+              });
+              
+            } catch (error) {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body: `❌ Error: ${error.message}`
+              });
+            }
