@@ -1,3 +1,5 @@
+```yaml
+
 env:
   DIGITAL_ORG: digital-org-name  # Replace with your digital org name
 
@@ -112,3 +114,4 @@ steps:
           state: 'closed'
         });
         console.log('Issue closed');
+```
