@@ -449,3 +449,118 @@ jobs:
                 throw error;  // Only throw if it's a real error
               }
             }
+========================================================================================================================================================
+
+env:
+  DIGITAL_ORG: digital-org-name  # Replace with your digital org name
+
+steps:
+  - name: Generate GitHub App Token
+    id: get-token
+    uses: actions/create-github-app-token@v1
+    with:
+      app-id: ${{ secrets.APP_ID }}
+      private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      owner: ${{ env.DIGITAL_ORG }}
+
+  - name: Process Member Management
+    uses: actions/github-script@v7
+    with:
+      github-token: ${{ steps.get-token.outputs.token }}
+      script: |
+        async function performAction(action, username) {
+          try {
+            switch(action) {
+              case 'Add member':
+                await github.rest.orgs.createInvitation({
+                  org: process.env.DIGITAL_ORG,
+                  username: username,
+                  role: 'direct_member'
+                });
+                return true;
+                
+              case 'Remove member':
+                await github.rest.orgs.removeMember({
+                  org: process.env.DIGITAL_ORG,
+                  username: username
+                });
+                return true;
+                
+              case 'Make owner':
+                await github.rest.orgs.setMembershipForUser({
+                  org: process.env.DIGITAL_ORG,
+                  username: username,
+                  role: 'admin'
+                });
+                return true;
+                
+              case 'Remove owner':
+                await github.rest.orgs.setMembershipForUser({
+                  org: process.env.DIGITAL_ORG,
+                  username: username,
+                  role: 'member'
+                });
+                return true;
+            }
+          } catch (e) {
+            if (e.status === 404 && action === 'Remove member') {
+              // Ignore 404 for remove operations as the user might already be removed
+              return true;
+            }
+            throw e;
+          }
+          return false;
+        }
+
+        try {
+          const issue = context.payload.issue;
+          const action = issue.body.match(/### Action\s*([^\n]+)/)[1].trim();
+          const username = issue.body.match(/### GitHub Username\s*([^\n]+)/)[1].trim();
+          
+          const success = await performAction(action, username);
+          
+          if (success) {
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body: `✅ Action completed successfully:
+              - Action: ${action}
+              - User: @${username}
+              - Organization: ${process.env.DIGITAL_ORG}`
+            });
+            
+            await github.rest.issues.update({
+              ...context.repo,
+              issue_number: context.issue.number,
+              state: 'closed'
+            });
+          } else {
+            throw new Error('Action failed to complete');
+          }
+          
+        } catch (error) {
+          // Only create error comment for non-404 errors or if it's not a removal action
+          if (error.status !== 404 || !error.message.includes('Not Found')) {
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body: `❌ Error: ${error.message}\n\nPlease verify:\n1. The username exists\n2. The action is valid\n3. The user's current state allows this action`
+            });
+          } else {
+            // If it's a 404 error but the action was successful, close with success
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body: `✅ Action completed successfully:
+              - Action: ${action}
+              - User: @${username}
+              - Organization: ${process.env.DIGITAL_ORG}`
+            });
+            
+            await github.rest.issues.update({
+              ...context.repo,
+              issue_number: context.issue.number,
+              state: 'closed'
+            });
+          }
+        }
