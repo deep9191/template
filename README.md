@@ -139,3 +139,109 @@ jobs:
                 body: `❌ Error: ${error.message}`
               });
             }
+=================================================================================================
+
+name: Cross-Org Member Management
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  manage-member:
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.labels.*.name, 'member-management')
+    
+    env:
+      DIGITAL_ORG: digital-org-name  # Replace with your digital org name
+
+    steps:
+      - name: Process Member Management
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DIGITAL_ORG_TOKEN }}
+          script: |
+            const issue = context.payload.issue;
+            const action = issue.body.match(/### Action\s*([^\n]+)/)[1].trim();
+            const username = issue.body.match(/### GitHub Username\s*([^\n]+)/)[1].trim();
+            
+            try {
+              // First verify admin access
+              console.log('Checking admin permissions...');
+              const { data: membership } = await github.rest.orgs.getMembershipForUser({
+                org: process.env.DIGITAL_ORG,
+                username: context.actor
+              });
+              
+              if (membership.role !== 'admin') {
+                throw new Error('You need admin permissions in the digital organization');
+              }
+              
+              console.log('Admin access verified, processing action...');
+              
+              // Process the requested action
+              switch(action) {
+                case 'Add member':
+                  await github.rest.orgs.setMembershipForUser({
+                    org: process.env.DIGITAL_ORG,
+                    username: username,
+                    role: 'member'
+                  });
+                  break;
+                  
+                case 'Remove member':
+                  await github.rest.orgs.removeMembershipForUser({
+                    org: process.env.DIGITAL_ORG,
+                    username: username
+                  });
+                  break;
+                  
+                case 'Make owner':
+                  await github.rest.orgs.setMembershipForUser({
+                    org: process.env.DIGITAL_ORG,
+                    username: username,
+                    role: 'admin'
+                  });
+                  break;
+                  
+                case 'Remove owner':
+                  await github.rest.orgs.setMembershipForUser({
+                    org: process.env.DIGITAL_ORG,
+                    username: username,
+                    role: 'member'
+                  });
+                  break;
+                
+                default:
+                  throw new Error(`Unknown action: ${action}`);
+              }
+              
+              console.log('Action completed successfully');
+              
+              // Add success comment
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body: `✅ Successfully completed: ${action} for @${username} in ${process.env.DIGITAL_ORG}`
+              });
+              
+              // Close the issue
+              await github.rest.issues.update({
+                ...context.repo,
+                issue_number: context.issue.number,
+                state: 'closed',
+                state_reason: 'completed'
+              });
+              
+            } catch (error) {
+              console.error('Error:', error);
+              
+              // Add error comment
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body: `❌ Error: ${error.message}\n\nPlease verify:\n1. The username exists\n2. You have proper permissions\n3. The requested action is valid`
+              });
+              
+              // Don't close the issue on error
+              throw error;
+            }
