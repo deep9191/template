@@ -244,4 +244,102 @@ jobs:
               
               // Don't close the issue on error
               throw error;
+            }45
+
+
+
+====================================================================================================================================================
+name: Cross-Org Member Management
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  manage-member:
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.labels.*.name, 'member-management')
+    
+    env:
+      DIGITAL_ORG: digital-org-name  # Replace with your digital org name
+
+    steps:
+      - name: Generate GitHub App Token
+        id: get-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ env.DIGITAL_ORG }}
+
+      - name: Process Member Management
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.get-token.outputs.token }}
+          script: |
+            try {
+              const issue = context.payload.issue;
+              const action = issue.body.match(/### Action\s*([^\n]+)/)[1].trim();
+              const username = issue.body.match(/### GitHub Username\s*([^\n]+)/)[1].trim();
+              
+              console.log('Processing action:', action);
+              console.log('Target username:', username);
+              
+              switch(action) {
+                case 'Add member':
+                  await github.rest.orgs.createInvitation({
+                    org: process.env.DIGITAL_ORG,
+                    username: username,
+                    role: 'direct_member'
+                  });
+                  break;
+                  
+                case 'Remove member':
+                  await github.rest.orgs.removeMember({
+                    org: process.env.DIGITAL_ORG,
+                    username: username
+                  });
+                  break;
+                  
+                case 'Make owner':
+                  await github.rest.orgs.setMembershipForUser({
+                    org: process.env.DIGITAL_ORG,
+                    username: username,
+                    role: 'admin'
+                  });
+                  break;
+                  
+                case 'Remove owner':
+                  await github.rest.orgs.setMembershipForUser({
+                    org: process.env.DIGITAL_ORG,
+                    username: username,
+                    role: 'member'
+                  });
+                  break;
+              }
+              
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body: `✅ Action completed successfully:
+                - Action: ${action}
+                - User: @${username}
+                - Organization: ${process.env.DIGITAL_ORG}`
+              });
+              
+              await github.rest.issues.update({
+                ...context.repo,
+                issue_number: context.issue.number,
+                state: 'closed'
+              });
+              
+            } catch (error) {
+              console.error('Error:', error);
+              
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body: `❌ Error: ${error.message}\n\nPlease verify:\n1. The username exists\n2. The action is valid\n3. The user's current state allows this action`
+              });
+              
+              throw error;
             }
