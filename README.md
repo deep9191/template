@@ -218,3 +218,70 @@ jobs:
           # Always exit successfully
           exit 0
 ```
+================================================================================================================================
+
+```yaml
+
+env:
+  DIGITAL_ORG: digital-org-name  # Replace with your digital org name
+
+steps:
+  - name: Generate GitHub App Token
+    id: get-token
+    uses: actions/create-github-app-token@v1
+    with:
+      app-id: ${{ secrets.APP_ID }}
+      private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      owner: ${{ env.DIGITAL_ORG }}
+
+  - name: Process Member Management
+    id: process
+    continue-on-error: true  # This ensures the workflow doesn't fail
+    env:
+      GH_TOKEN: ${{ steps.get-token.outputs.token }}
+    run: |
+      # Parse issue body
+      ISSUE_BODY=$(gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }} --jq .body)
+      
+      # Extract action and username
+      ACTION=$(echo "$ISSUE_BODY" | grep -A1 "### Action" | tail -n1 | xargs)
+      USERNAME=$(echo "$ISSUE_BODY" | grep -A1 "### GitHub Username" | tail -n1 | xargs)
+      
+      echo "Processing action: $ACTION for user: $USERNAME"
+      
+      # Process based on action
+      case "$ACTION" in
+        "Add member")
+          gh api --method POST /orgs/$DIGITAL_ORG/invitations \
+            -f username="$USERNAME" -f role="direct_member" || true
+          ;;
+          
+        "Remove member")
+          gh api --method DELETE /orgs/$DIGITAL_ORG/members/$USERNAME || true
+          ;;
+          
+        "Make owner")
+          gh api --method PUT /orgs/$DIGITAL_ORG/memberships/$USERNAME \
+            -f role="admin" || true
+          ;;
+          
+        "Remove owner")
+          gh api --method PUT /orgs/$DIGITAL_ORG/memberships/$USERNAME \
+            -f role="member" || true
+          ;;
+      esac
+      
+      # Add success comment regardless of result
+      gh issue comment ${{ github.event.issue.number }} --body "✅ Action completed:
+      - Action: $ACTION
+      - User: @$USERNAME
+      - Organization: $DIGITAL_ORG"
+
+  - name: Close Issue
+    if: always()  # Always run this step
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    run: |
+      gh issue close ${{ github.event.issue.number }}
+      echo "Issue closed"
+```
