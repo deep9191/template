@@ -1,287 +1,215 @@
 ```yaml
 
-env:
-  DIGITAL_ORG: digital-org-name  # Replace with your digital org name
+name: Repository Archive IssueOps
 
-steps:
-  - name: Generate GitHub App Token
-    id: get-token
-    uses: actions/create-github-app-token@v1
-    with:
-      app-id: ${{ secrets.APP_ID }}
-      private-key: ${{ secrets.APP_PRIVATE_KEY }}
-      owner: ${{ env.DIGITAL_ORG }}
-
-  - name: Process Member Management
-    id: process
-    continue-on-error: true  # This ensures the workflow doesn't fail
-    uses: actions/github-script@v7
-    with:
-      github-token: ${{ steps.get-token.outputs.token }}
-      script: |
-        async function performAction(action, username) {
-          try {
-            switch(action) {
-              case 'Add member':
-                await github.rest.orgs.createInvitation({
-                  org: process.env.DIGITAL_ORG,
-                  username: username,
-                  role: 'direct_member'
-                });
-                return { success: true };
-                
-              case 'Remove member':
-                await github.rest.orgs.removeMember({
-                  org: process.env.DIGITAL_ORG,
-                  username: username
-                });
-                return { success: true };
-                
-              case 'Make owner':
-                await github.rest.orgs.setMembershipForUser({
-                  org: process.env.DIGITAL_ORG,
-                  username: username,
-                  role: 'admin'
-                });
-                return { success: true };
-                
-              case 'Remove owner':
-                await github.rest.orgs.setMembershipForUser({
-                  org: process.env.DIGITAL_ORG,
-                  username: username,
-                  role: 'member'
-                });
-                return { success: true };
-            }
-          } catch (e) {
-            console.error('Error performing action:', e);
-            return { 
-              success: false, 
-              error: e.message,
-              status: e.status
-            };
-          }
-          return { success: false, error: 'Unknown action' };
-        }
-
-        const issue = context.payload.issue;
-        const action = issue.body.match(/### Action\s*([^\n]+)/)[1].trim();
-        const username = issue.body.match(/### GitHub Username\s*([^\n]+)/)[1].trim();
-        
-        console.log(`Processing: ${action} for user ${username}`);
-        
-        const result = await performAction(action, username);
-        
-        if (result.success) {
-          console.log('Action completed successfully');
-        } else {
-          console.error(`Action failed: ${result.error}`);
-        }
-        
-        // Always add a comment with the result
-        let commentBody;
-        if (result.success) {
-          commentBody = `✅ Action completed successfully:
-          - Action: ${action}
-          - User: @${username}
-          - Organization: ${process.env.DIGITAL_ORG}`;
-        } else {
-          commentBody = `⚠️ Action may have encountered issues:
-          - Action: ${action}
-          - User: @${username}
-          - Organization: ${process.env.DIGITAL_ORG}
-          - Note: ${result.error || 'Unknown error'}`;
-        }
-        
-        await github.rest.issues.createComment({
-          ...context.repo,
-          issue_number: context.issue.number,
-          body: commentBody
-        });
-        
-        // Return the result for potential use in later steps
-        return result;
-
-  - name: Close Issue
-    if: always()  # Always run this step
-    uses: actions/github-script@v7
-    with:
-      github-token: ${{ secrets.GITHUB_TOKEN }}
-      script: |
-        await github.rest.issues.update({
-          ...context.repo,
-          issue_number: context.payload.issue.number,
-          state: 'closed'
-        });
-        console.log('Issue closed');
-```
-==================================================================================
-
-```yaml
-
-name: Cross-Org Member Management
 on:
   issues:
-    types: [opened]
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
 
 jobs:
-  manage-member:
+  process-archive-request:
     runs-on: ubuntu-latest
-    if: contains(github.event.issue.labels.*.name, 'member-management')
-    
-    env:
-      DIGITAL_ORG: digital-org-name  # Replace with your digital org name
+    # Only run on issues, not PRs
+    if: ${{ github.event.issue && !github.event.issue.pull_request }}
     
     steps:
-      - name: Install GitHub CLI
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: tibdex/github-app-token@v1
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+      
+      - name: Setup GitHub CLI
         run: |
-          type -p curl >/dev/null || (apt update && apt install curl -y)
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
-          && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
-          && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-          && apt update \
-          && apt install gh -y
-
-      - name: Setup GitHub App Authentication
-        id: setup-app
+          echo "${{ steps.generate-token.outputs.token }}" > gh_token.txt
+          gh auth login --with-token < gh_token.txt
+          rm gh_token.txt
         env:
-          APP_ID: ${{ secrets.APP_ID }}
-          PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+      
+      - name: Get issue information
+        id: issue-info
         run: |
-          echo "$PRIVATE_KEY" > private-key.pem
-          TOKEN=$(gh auth login --with-token <<< $(gh api --method POST -H "Accept: application/vnd.github+json" \
-            /app/installations/${{ secrets.APP_INSTALLATION_ID }}/access_tokens \
-            --app $APP_ID \
-            --key private-key.pem | jq -r .token))
-          echo "::add-mask::$TOKEN"
-          echo "token=$TOKEN" >> $GITHUB_OUTPUT
-          rm private-key.pem
-
-      - name: Parse Issue and Process Request
-        env:
-          GH_TOKEN: ${{ steps.setup-app.outputs.token }}
-        run: |
-          # Parse issue body
-          ISSUE_BODY=$(gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }} --jq .body)
+          # Get issue details
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          ISSUE_BODY=$(gh issue view $ISSUE_NUMBER --json body -q .body)
           
-          # Extract action and username
-          ACTION=$(echo "$ISSUE_BODY" | grep -A1 "### Action" | tail -n1 | xargs)
-          USERNAME=$(echo "$ISSUE_BODY" | grep -A1 "### GitHub Username" | tail -n1 | xargs)
-          
-          echo "Processing action: $ACTION for user: $USERNAME"
-          
-          # Set up error handling
-          set +e  # Don't exit on error
-          
-          # Process based on action
-          case "$ACTION" in
-            "Add member")
-              gh api --method POST /orgs/$DIGITAL_ORG/invitations \
-                -f email="" -f role="direct_member" -f username="$USERNAME"
-              ;;
-              
-            "Remove member")
-              gh api --method DELETE /orgs/$DIGITAL_ORG/members/$USERNAME
-              ;;
-              
-            "Make owner")
-              gh api --method PUT /orgs/$DIGITAL_ORG/memberships/$USERNAME \
-                -f role="admin"
-              ;;
-              
-            "Remove owner")
-              gh api --method PUT /orgs/$DIGITAL_ORG/memberships/$USERNAME \
-                -f role="member"
-              ;;
-          esac
-          
-          # Capture exit code but don't fail
-          EXIT_CODE=$?
-          
-          # Add comment based on result
-          if [ $EXIT_CODE -eq 0 ]; then
-            gh issue comment ${{ github.event.issue.number }} --body "✅ Action completed successfully:
-            - Action: $ACTION
-            - User: @$USERNAME
-            - Organization: $DIGITAL_ORG"
+          # If this is a comment event, get the comment body
+          if [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            COMMENT_ID="${{ github.event.comment.id }}"
+            COMMENT_BODY=$(gh api repos/${{ github.repository }}/issues/comments/$COMMENT_ID --jq .body)
           else
-            gh issue comment ${{ github.event.issue.number }} --body "⚠️ Action may have encountered issues:
-            - Action: $ACTION
-            - User: @$USERNAME
-            - Organization: $DIGITAL_ORG
-            - Note: The action was attempted but may not have completed successfully."
+            COMMENT_BODY=""
           fi
           
-          # Always close the issue
-          gh issue close ${{ github.event.issue.number }}
+          # Check for delete command in comment or issue body
+          DELETE_COMMAND_REGEX="^/delete-repo[[:space:]]+([[:alnum:]_-]+)"
           
-          # Always exit successfully
-          exit 0
+          if [[ "$COMMENT_BODY" =~ $DELETE_COMMAND_REGEX ]]; then
+            REPO_TO_DELETE="${BASH_REMATCH[1]}"
+            IS_DELETE_COMMAND="true"
+          elif [[ "${{ github.event.action }}" == "opened" ]] && [[ "${{ contains(github.event.issue.labels.*.name, 'archive-request') }}" == "true" ]]; then
+            # Parse form data from issue template
+            REPO_TO_DELETE=$(echo "$ISSUE_BODY" | grep -A 1 "### Repository Name" | tail -n 1 | xargs)
+            if [[ -n "$REPO_TO_DELETE" ]]; then
+              IS_DELETE_COMMAND="true"
+            else
+              IS_DELETE_COMMAND="false"
+            fi
+          else
+            IS_DELETE_COMMAND="false"
+            REPO_TO_DELETE=""
+          fi
+          
+          echo "is-delete-command=$IS_DELETE_COMMAND" >> $GITHUB_OUTPUT
+          echo "repo-to-delete=$REPO_TO_DELETE" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+      
+      - name: Verify admin permissions
+        if: ${{ steps.issue-info.outputs.is-delete-command == 'true' }}
+        id: verify-permissions
+        run: |
+          REPO_TO_DELETE="${{ steps.issue-info.outputs.repo-to-delete }}"
+          REQUESTER="${{ github.event.issue.user.login }}"
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          
+          # Check if user has admin permissions
+          PERMISSION=$(gh api repos/${{ github.repository_owner }}/$REPO_TO_DELETE/collaborators/$REQUESTER/permission --jq .permission || echo "error")
+          
+          if [[ "$PERMISSION" == "admin" ]]; then
+            echo "is-admin=true" >> $GITHUB_OUTPUT
+          else
+            echo "is-admin=false" >> $GITHUB_OUTPUT
+            
+            # Add comment about insufficient permissions
+            if [[ "$PERMISSION" == "error" ]]; then
+              gh issue comment $ISSUE_NUMBER --body "Error verifying permissions. Please make sure the repository exists and is accessible."
+            else
+              gh issue comment $ISSUE_NUMBER --body "@$REQUESTER You don't have admin permissions on the repository \`$REPO_TO_DELETE\`. Only repository admins can archive repositories."
+            fi
+          fi
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+      
+      - name: Process archive request
+        if: ${{ steps.issue-info.outputs.is-delete-command == 'true' && steps.verify-permissions.outputs.is-admin == 'true' }}
+        id: archive-repo
+        run: |
+          REPO_TO_DELETE="${{ steps.issue-info.outputs.repo-to-delete }}"
+          SOURCE_ORG="${{ github.repository_owner }}"
+          ARCHIVE_ORG="DigitalArchive"  # Replace with your actual archive org name
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          
+          # Add comment that we're processing the request
+          gh issue comment $ISSUE_NUMBER --body "Processing archive request for repository \`$REPO_TO_DELETE\`..."
+          
+          # Check if repo with same name exists in archive org
+          TARGET_REPO_NAME="$REPO_TO_DELETE"
+          REPO_EXISTS=$(gh api repos/$ARCHIVE_ORG/$TARGET_REPO_NAME --silent || echo "not_found")
+          
+          if [[ "$REPO_EXISTS" != "not_found" ]]; then
+            # Generate random suffix
+            SUFFIX="-$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 4 | head -n 1)"
+            TARGET_REPO_NAME="${REPO_TO_DELETE}${SUFFIX}"
+            
+            # Log the name change
+            gh issue comment $ISSUE_NUMBER --body "A repository with the name \`$REPO_TO_DELETE\` already exists in the archive organization. Will use name \`$TARGET_REPO_NAME\` instead."
+          fi
+          
+          # Transfer the repository
+          TRANSFER_RESULT=$(gh api -X POST repos/$SOURCE_ORG/$REPO_TO_DELETE/transfer \
+            -f new_owner="$ARCHIVE_ORG" \
+            -f new_name="$TARGET_REPO_NAME" || echo "transfer_failed")
+          
+          if [[ "$TRANSFER_RESULT" == "transfer_failed" ]]; then
+            gh issue comment $ISSUE_NUMBER --body "Error transferring repository. Please check if the repository exists and you have the necessary permissions."
+            exit 1
+          fi
+          
+          # Archive the repository in its new location
+          gh api -X PATCH repos/$ARCHIVE_ORG/$TARGET_REPO_NAME -f archived=true
+          
+          # Get the new repository URL
+          ARCHIVED_REPO_URL="https://github.com/$ARCHIVE_ORG/$TARGET_REPO_NAME"
+          
+          # Add comment with the result
+          gh issue comment $ISSUE_NUMBER --body "Repo \`$REPO_TO_DELETE\` has been deleted. Archive can be found at $ARCHIVED_REPO_URL"
+          
+          # Close the issue
+          gh issue close $ISSUE_NUMBER
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+
+
+
 ```
-================================================================================================================================
+
+
 
 ```yaml
+name: Repository Archive Request
+description: Request to archive a repository by moving it to the Digital Archive organization
+title: "[ARCHIVE] Repository archive request for: "
+labels: ["archive-request"]
+assignees: []
 
-env:
-  DIGITAL_ORG: digital-org-name  # Replace with your digital org name
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Repository Archive Request
+        
+        This form will help you request archiving a repository by moving it from the current organization to the Digital Archive organization.
+        
+        **Note:** You must have admin permissions on the repository to request archiving.
 
-steps:
-  - name: Generate GitHub App Token
-    id: get-token
-    uses: actions/create-github-app-token@v1
-    with:
-      app-id: ${{ secrets.APP_ID }}
-      private-key: ${{ secrets.APP_PRIVATE_KEY }}
-      owner: ${{ env.DIGITAL_ORG }}
+  - type: input
+    id: repository-name
+    attributes:
+      label: Repository Name
+      description: The name of the repository you want to archive
+      placeholder: e.g., my-project-repo
+    validations:
+      required: true
 
-  - name: Process Member Management
-    id: process
-    continue-on-error: true  # This ensures the workflow doesn't fail
-    env:
-      GH_TOKEN: ${{ steps.get-token.outputs.token }}
-    run: |
-      # Parse issue body
-      ISSUE_BODY=$(gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }} --jq .body)
-      
-      # Extract action and username
-      ACTION=$(echo "$ISSUE_BODY" | grep -A1 "### Action" | tail -n1 | xargs)
-      USERNAME=$(echo "$ISSUE_BODY" | grep -A1 "### GitHub Username" | tail -n1 | xargs)
-      
-      echo "Processing action: $ACTION for user: $USERNAME"
-      
-      # Process based on action
-      case "$ACTION" in
-        "Add member")
-          gh api --method POST /orgs/$DIGITAL_ORG/invitations \
-            -f username="$USERNAME" -f role="direct_member" || true
-          ;;
-          
-        "Remove member")
-          gh api --method DELETE /orgs/$DIGITAL_ORG/members/$USERNAME || true
-          ;;
-          
-        "Make owner")
-          gh api --method PUT /orgs/$DIGITAL_ORG/memberships/$USERNAME \
-            -f role="admin" || true
-          ;;
-          
-        "Remove owner")
-          gh api --method PUT /orgs/$DIGITAL_ORG/memberships/$USERNAME \
-            -f role="member" || true
-          ;;
-      esac
-      
-      # Add success comment regardless of result
-      gh issue comment ${{ github.event.issue.number }} --body "✅ Action completed:
-      - Action: $ACTION
-      - User: @$USERNAME
-      - Organization: $DIGITAL_ORG"
+  - type: textarea
+    id: reason
+    attributes:
+      label: Reason for Archiving
+      description: Please provide a brief explanation for why this repository should be archived
+      placeholder: This project is no longer active and should be archived for historical reference.
+    validations:
+      required: true
 
-  - name: Close Issue
-    if: always()  # Always run this step
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    run: |
-      gh issue close ${{ github.event.issue.number }}
-      echo "Issue closed"
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      description: Please confirm the following before submitting
+      options:
+        - label: I have admin permissions on this repository
+          required: true
+        - label: I understand that this repository will be moved to the Digital Archive organization
+          required: true
+        - label: I understand that the repository will be marked as archived after the move
+          required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ## Command
+        
+        After submitting this issue, the workflow will process your request automatically.
+        Alternatively, you can trigger the archiving process by adding the following command in a comment:
+        
+        ```
+        /delete-repo repository-name
+        ```
 ```
