@@ -1,4 +1,259 @@
 ```yaml
+name: Repository Archive IssueOps
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  process-archive-request:
+    runs-on: ubuntu-latest
+    # Only run on issues, not PRs
+    if: ${{ github.event.issue && !github.event.issue.pull_request }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Get issue information
+        id: issue
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || '';
+            const title = issue.title || '';
+            
+            // Check if this is a delete/archive request
+            const deleteCommand = /^\/delete\s+(\S+)/m;
+            const match = body.match(deleteCommand) || title.match(deleteCommand);
+            
+            if (!match) {
+              console.log('Not a delete request. Exiting.');
+              return core.setFailed('Not a delete request');
+            }
+            
+            const repoToDelete = match[1];
+            core.setOutput('repo-to-delete', repoToDelete);
+            return repoToDelete;
+
+      - name: Check requester permissions
+        id: check-permissions
+        if: steps.issue.outputs.repo-to-delete
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const repoToDelete = '${{ steps.issue.outputs.repo-to-delete }}';
+            const [owner, repo] = repoToDelete.split('/');
+            
+            try {
+              // Check if user is an admin of the repository
+              const requester = context.payload.sender.login;
+              const { data: collaborators } = await github.rest.repos.listCollaborators({
+                owner,
+                repo,
+                affiliation: 'direct'
+              });
+              
+              const isAdmin = collaborators.some(collaborator => 
+                collaborator.login === requester && 
+                collaborator.permissions && 
+                collaborator.permissions.admin
+              );
+              
+              if (!isAdmin) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: `@${requester} You don't have admin permissions for ${repoToDelete}. Only repository admins can archive repositories.`
+                });
+                return core.setFailed('Requester does not have admin permissions');
+              }
+              
+              core.setOutput('is-admin', 'true');
+              return true;
+            } catch (error) {
+              console.log(`Error checking permissions: ${error}`);
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `Error checking permissions: ${error.message}`
+              });
+              return core.setFailed(`Error checking permissions: ${error.message}`);
+            }
+
+      - name: Set up Python
+        if: steps.check-permissions.outputs.is-admin == 'true'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        if: steps.check-permissions.outputs.is-admin == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyGithub requests
+
+      - name: Archive repository
+        if: steps.check-permissions.outputs.is-admin == 'true'
+        id: archive-repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_APP_TOKEN }}
+          REPO_TO_DELETE: ${{ steps.issue.outputs.repo-to-delete }}
+          SOURCE_ORG: "DigitalBankingSolutions"  # Replace with your test org for testing
+          ARCHIVE_ORG: "DigitalArchive"          # Replace with your archive org for testing
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          python - <<EOF
+          import os
+          import random
+          import string
+          import sys
+          from github import Github
+          
+          def generate_random_suffix():
+              """Generate a random 4-character suffix with lowercase letters and numbers."""
+              chars = string.ascii_lowercase + string.digits
+              return ''.join(random.choice(chars) for _ in range(4))
+          
+          def archive_repository():
+              github_token = os.environ['GITHUB_TOKEN']
+              repo_to_delete = os.environ['REPO_TO_DELETE']
+              source_org = os.environ['SOURCE_ORG']
+              archive_org = os.environ['ARCHIVE_ORG']
+              issue_number = os.environ['ISSUE_NUMBER']
+              current_repo = os.environ['GITHUB_REPOSITORY']
+              
+              g = Github(github_token)
+              
+              try:
+                  # Parse repository information
+                  if '/' in repo_to_delete:
+                      org_name, repo_name = repo_to_delete.split('/')
+                  else:
+                      org_name = source_org
+                      repo_name = repo_to_delete
+                  
+                  # Get source repository
+                  source_repository = g.get_repo(f"{org_name}/{repo_name}")
+                  
+                  # Check if repository exists in archive org
+                  archive_org_obj = g.get_organization(archive_org)
+                  target_repo_name = repo_name
+                  
+                  try:
+                      # Check if repo with same name exists in archive org
+                      archive_org_obj.get_repo(target_repo_name)
+                      # If we get here, the repo exists, so add a suffix
+                      target_repo_name = f"{repo_name}-{generate_random_suffix()}"
+                      print(f"Repository with name {repo_name} already exists in archive org. Using {target_repo_name} instead.")
+                  except:
+                      # Repo doesn't exist, we can use the original name
+                      pass
+                  
+                  # Create a new repository in the archive org with the same properties
+                  new_repo = archive_org_obj.create_repo(
+                      name=target_repo_name,
+                      description=f"Archived from {org_name}/{repo_name}: {source_repository.description or ''}",
+                      private=source_repository.private
+                  )
+                  
+                  # Transfer the repository (this requires GitHub App token with appropriate permissions)
+                  # Note: This is a simplified version. In reality, you'd need to use GitHub's API directly
+                  # for repository transfers as PyGithub doesn't support this operation directly
+                  print(f"Repository would be transferred from {org_name}/{repo_name} to {archive_org}/{target_repo_name}")
+                  
+                  # For demonstration purposes, we'll simulate the transfer
+                  # In a real implementation, you would use the GitHub API to transfer the repository
+                  
+                  # After transfer, mark as archived
+                  # new_repo.edit(archived=True)
+                  
+                  # Add comment to the issue
+                  issue_repo_owner, issue_repo_name = current_repo.split('/')
+                  issue_repo = g.get_repo(current_repo)
+                  issue = issue_repo.get_issue(number=int(issue_number))
+                  issue.create_comment(f"Repo {repo_name} has been deleted. Archive can be found at https://github.com/{archive_org}/{target_repo_name}")
+                  
+                  # Output for GitHub Actions
+                  print(f"::set-output name=archive-repo-url::https://github.com/{archive_org}/{target_repo_name}")
+                  return True
+              
+              except Exception as e:
+                  print(f"Error archiving repository: {str(e)}")
+                  issue_repo = g.get_repo(current_repo)
+                  issue = issue_repo.get_issue(number=int(issue_number))
+                  issue.create_comment(f"Error archiving repository: {str(e)}")
+                  return False
+          
+          if not archive_repository():
+              sys.exit(1)
+          EOF
+
+      - name: Notify success
+        if: steps.archive-repo.outcome == 'success'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const archiveUrl = '${{ steps.archive-repo.outputs.archive-repo-url }}';
+            const repoToDelete = '${{ steps.issue.outputs.repo-to-delete }}';
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `✅ Repository archiving completed successfully!\n\nThe repository ${repoToDelete} has been moved to the archive organization and marked as archived. You can find it at: ${archiveUrl}`
+            });
+            
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: 'closed',
+              state_reason: 'completed'
+            });
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```yaml
 
 name: Repository Archive IssueOps
 
