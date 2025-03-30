@@ -32,13 +32,6 @@ jobs:
           app_id: ${{ secrets.BANKING_ORG_APP_ID }}
           private_key: ${{ secrets.BANKING_ORG_PRIVATE_KEY }}
       
-      - name: Generate Archive Org GitHub App Token
-        id: generate-archive-token
-        uses: tibdex/github-app-token@v1
-        with:
-          app_id: ${{ secrets.ARCHIVE_ORG_APP_ID }}
-          private_key: ${{ secrets.ARCHIVE_ORG_PRIVATE_KEY }}
-      
       - name: Get issue information
         id: issue
         uses: actions/github-script@v6
@@ -145,27 +138,20 @@ jobs:
         env:
           TEST_TOKEN: ${{ steps.generate-test-token.outputs.token }}
           BANKING_TOKEN: ${{ steps.generate-banking-token.outputs.token }}
-          ARCHIVE_TOKEN: ${{ steps.generate-archive-token.outputs.token }}
           SOURCE_ORG: ${{ steps.check-permissions.outputs.org-name }}
           REPO_NAME: ${{ steps.check-permissions.outputs.repo-name }}
-          ARCHIVE_ORG: "DigitalArchive"  # Replace with your archive org
           BANKING_ORG: "DigitalBankingSolutions"  # Replace with your banking solutions org
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           # Get current date in YYYYMMDD format
           TODAY=$(date +"%Y%m%d")
           
-          # Get repository details before archiving
+          # Get repository details before deleting
           echo "Getting repository details for $SOURCE_ORG/$REPO_NAME"
-          # Use the appropriate token based on the source org
-          if [[ "$SOURCE_ORG" == "TestOrg" ]]; then
-            export GITHUB_TOKEN=$TEST_TOKEN
-          else
-            # Default to test token if not recognized
-            export GITHUB_TOKEN=$TEST_TOKEN
-          fi
+          # Use the test token for source org operations
+          export GITHUB_TOKEN=$TEST_TOKEN
           
-          REPO_DESC=$(gh api repos/$SOURCE_ORG/$REPO_NAME --jq '.description // "Archived repository"')
+          REPO_DESC=$(gh api repos/$SOURCE_ORG/$REPO_NAME --jq '.description // "Repository"')
           REPO_PRIVATE=$(gh api repos/$SOURCE_ORG/$REPO_NAME --jq '.private')
           REPO_TOPICS=$(gh api repos/$SOURCE_ORG/$REPO_NAME/topics --jq '.names | join(",")' || echo "")
           REPO_HOMEPAGE=$(gh api repos/$SOURCE_ORG/$REPO_NAME --jq '.homepage // ""')
@@ -177,44 +163,7 @@ jobs:
             VISIBILITY="--public"
           fi
           
-          # Step 1: Check if repository exists in archive org
-          TARGET_REPO_NAME=$REPO_NAME
-          
-          # Use archive token for archive org operations
-          export GITHUB_TOKEN=$ARCHIVE_TOKEN
-          
-          if gh repo view $ARCHIVE_ORG/$TARGET_REPO_NAME &>/dev/null; then
-            # Repository with same name exists in archive org, add random suffix
-            SUFFIX=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 4 | head -n 1)
-            TARGET_REPO_NAME="${REPO_NAME}-${SUFFIX}"
-            echo "Repository with name $REPO_NAME already exists in archive org. Using $TARGET_REPO_NAME instead."
-          fi
-          
-          # Step 2: Create repository in archive org
-          echo "Creating repository in archive org: $ARCHIVE_ORG/$TARGET_REPO_NAME"
-          gh repo create $ARCHIVE_ORG/$TARGET_REPO_NAME $VISIBILITY --description "Archived from $SOURCE_ORG/$REPO_NAME: $REPO_DESC"
-          
-          # Step 3: Transfer repository to archive org
-          # For transfer, we need to use the source org token
-          if [[ "$SOURCE_ORG" == "TestOrg" ]]; then
-            export GITHUB_TOKEN=$TEST_TOKEN
-          else
-            export GITHUB_TOKEN=$TEST_TOKEN
-          fi
-          
-          echo "Transferring repository from $SOURCE_ORG/$REPO_NAME to $ARCHIVE_ORG/$TARGET_REPO_NAME"
-          gh api -X POST /repos/$SOURCE_ORG/$REPO_NAME/transfer \
-            -f new_owner=$ARCHIVE_ORG \
-            -f new_name=$TARGET_REPO_NAME
-          
-          # Step 4: Mark as archived in archive org
-          # Use archive token for archive org operations
-          export GITHUB_TOKEN=$ARCHIVE_TOKEN
-          
-          echo "Marking repository as archived in $ARCHIVE_ORG/$TARGET_REPO_NAME"
-          gh api -X PATCH repos/$ARCHIVE_ORG/$TARGET_REPO_NAME -f archived=true
-          
-          # Step 5: Create new repository in banking solutions org with date suffix
+          # Step 1: Create new repository in banking solutions org with date suffix
           # Use banking token for banking org operations
           export GITHUB_TOKEN=$BANKING_TOKEN
           
@@ -236,17 +185,20 @@ jobs:
             gh api -X PATCH repos/$BANKING_ORG/$NEW_REPO_NAME -f homepage="$REPO_HOMEPAGE"
           fi
           
-          # Use test token for commenting on the issue
+          # Step 2: Delete the repository from test org
+          # Use test token for test org operations
           export GITHUB_TOKEN=$TEST_TOKEN
+          
+          echo "Deleting repository from test org: $SOURCE_ORG/$REPO_NAME"
+          gh api -X DELETE /repos/$SOURCE_ORG/$REPO_NAME
           
           # Add comment to the issue
           gh issue comment $ISSUE_NUMBER --body "Repository processing completed:
           
-          - Original repo \`$SOURCE_ORG/$REPO_NAME\` has been archived at: https://github.com/$ARCHIVE_ORG/$TARGET_REPO_NAME
+          - Original repo \`$SOURCE_ORG/$REPO_NAME\` has been deleted
           - New repository created at: https://github.com/$BANKING_ORG/$NEW_REPO_NAME"
           
           # Set outputs for next steps
-          echo "archive-repo-url=https://github.com/$ARCHIVE_ORG/$TARGET_REPO_NAME" >> $GITHUB_OUTPUT
           echo "new-repo-url=https://github.com/$BANKING_ORG/$NEW_REPO_NAME" >> $GITHUB_OUTPUT
 
       - name: Notify success
@@ -254,20 +206,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ steps.generate-test-token.outputs.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
-          ARCHIVE_URL: ${{ steps.process-repo.outputs.archive-repo-url }}
           NEW_REPO_URL: ${{ steps.process-repo.outputs.new-repo-url }}
           REPO_TO_DELETE: ${{ steps.issue.outputs.repo-to-delete }}
         run: |
           gh issue comment $ISSUE_NUMBER --body "✅ Repository processing completed successfully!
 
-          - Original repository \`$REPO_TO_DELETE\` has been archived at: $ARCHIVE_URL
+          - Original repository \`$REPO_TO_DELETE\` has been deleted
           - New repository has been created at: $NEW_REPO_URL
           
           Note: The new repository is empty. You'll need to clone/push your code to the new repository."
           
-          gh issue close $ISSUE_NUMBER --comment "Repository archiving and recreation process completed."
-```
+          gh issue close $ISSUE_NUMBER --comment "Repository deletion and recreation process completed."
 
+
+```
 
 
 
