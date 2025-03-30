@@ -1,4 +1,214 @@
 ```yaml
+
+name: Repository Archive IssueOps
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  process-archive-request:
+    runs-on: ubuntu-latest
+    # Only run on issues, not PRs
+    if: ${{ github.event.issue && !github.event.issue.pull_request }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Get issue information
+        id: issue
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || '';
+            const title = issue.title || '';
+            
+            // Check if this is a delete/archive request
+            const deleteCommand = /^\/delete\s+(\S+)/m;
+            const match = body.match(deleteCommand) || title.match(deleteCommand);
+            
+            if (!match) {
+              console.log('Not a delete request. Exiting.');
+              return core.setFailed('Not a delete request');
+            }
+            
+            const repoToDelete = match[1];
+            core.setOutput('repo-to-delete', repoToDelete);
+            
+            // Add the repo-archive label to the issue
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: ['repo-archive']
+              });
+              console.log('Added repo-archive label to issue');
+            } catch (error) {
+              console.log(`Error adding label: ${error.message}`);
+              // Continue even if label addition fails
+            }
+            
+            return repoToDelete;
+
+      - name: Ensure repo-archive label exists
+        uses: actions/github-script@v6
+        with:
+          script: |
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'repo-archive'
+              });
+              console.log('repo-archive label already exists');
+            } catch (error) {
+              if (error.status === 404) {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: 'repo-archive',
+                  color: '6e5494', // Purple color
+                  description: 'Repository archiving request'
+                });
+                console.log('Created repo-archive label');
+              } else {
+                console.log(`Error checking label: ${error.message}`);
+              }
+            }
+
+      - name: Check requester permissions
+        id: check-permissions
+        if: steps.issue.outputs.repo-to-delete
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_TO_DELETE: ${{ steps.issue.outputs.repo-to-delete }}
+          REQUESTER: ${{ github.event.sender.login }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          # Parse repository information
+          if [[ "$REPO_TO_DELETE" == *"/"* ]]; then
+            ORG_NAME=$(echo $REPO_TO_DELETE | cut -d'/' -f1)
+            REPO_NAME=$(echo $REPO_TO_DELETE | cut -d'/' -f2)
+          else
+            ORG_NAME="DigitalBankingSolutions"  # Default org
+            REPO_NAME=$REPO_TO_DELETE
+          fi
+          
+          echo "Checking permissions for $REQUESTER on $ORG_NAME/$REPO_NAME"
+          
+          # Check if user is an admin of the repository
+          PERMISSION=$(gh api repos/$ORG_NAME/$REPO_NAME/collaborators/$REQUESTER/permission --jq '.permission' || echo "none")
+          
+          if [[ "$PERMISSION" != "admin" ]]; then
+            echo "User $REQUESTER does not have admin permissions on $ORG_NAME/$REPO_NAME"
+            gh issue comment $ISSUE_NUMBER --body "@$REQUESTER You don't have admin permissions for $ORG_NAME/$REPO_NAME. Only repository admins can archive repositories."
+            exit 1
+          fi
+          
+          echo "User $REQUESTER has admin permissions on $ORG_NAME/$REPO_NAME"
+          echo "org-name=$ORG_NAME" >> $GITHUB_OUTPUT
+          echo "repo-name=$REPO_NAME" >> $GITHUB_OUTPUT
+          echo "is-admin=true" >> $GITHUB_OUTPUT
+        
+      - name: Archive repository
+        if: steps.check-permissions.outputs.is-admin == 'true'
+        id: archive-repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_APP_TOKEN }}
+          SOURCE_ORG: ${{ steps.check-permissions.outputs.org-name }}
+          REPO_NAME: ${{ steps.check-permissions.outputs.repo-name }}
+          ARCHIVE_ORG: "DigitalArchive"  # Replace with your archive org for testing
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          # Check if repository exists in archive org
+          TARGET_REPO_NAME=$REPO_NAME
+          
+          if gh repo view $ARCHIVE_ORG/$TARGET_REPO_NAME &>/dev/null; then
+            # Repository with same name exists in archive org, add random suffix
+            SUFFIX=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 4 | head -n 1)
+            TARGET_REPO_NAME="${REPO_NAME}-${SUFFIX}"
+            echo "Repository with name $REPO_NAME already exists in archive org. Using $TARGET_REPO_NAME instead."
+          fi
+          
+          # Get repository description
+          REPO_DESC=$(gh api repos/$SOURCE_ORG/$REPO_NAME --jq '.description // "Archived repository"')
+          REPO_PRIVATE=$(gh api repos/$SOURCE_ORG/$REPO_NAME --jq '.private')
+          
+          echo "Creating repository in archive org: $ARCHIVE_ORG/$TARGET_REPO_NAME"
+          
+          # Create repository in archive org
+          if [[ "$REPO_PRIVATE" == "true" ]]; then
+            VISIBILITY="--private"
+          else
+            VISIBILITY="--public"
+          fi
+          
+          # Create the repository in the archive org
+          gh repo create $ARCHIVE_ORG/$TARGET_REPO_NAME $VISIBILITY --description "Archived from $SOURCE_ORG/$REPO_NAME: $REPO_DESC"
+          
+          # In a real implementation, you would transfer the repository using GitHub API
+          # For demonstration, we'll simulate the transfer with the gh api command
+          echo "Transferring repository from $SOURCE_ORG/$REPO_NAME to $ARCHIVE_ORG/$TARGET_REPO_NAME"
+          
+          # Transfer repository using GitHub API
+          # Note: This requires the GITHUB_APP_TOKEN to have appropriate permissions
+          gh api -X POST /repos/$SOURCE_ORG/$REPO_NAME/transfer \
+            -f new_owner=$ARCHIVE_ORG \
+            -f new_name=$TARGET_REPO_NAME
+          
+          # After transfer, mark as archived
+          gh api -X PATCH repos/$ARCHIVE_ORG/$TARGET_REPO_NAME -f archived=true
+          
+          # Add comment to the issue
+          gh issue comment $ISSUE_NUMBER --body "Repo $REPO_NAME has been deleted. Archive can be found at https://github.com/$ARCHIVE_ORG/$TARGET_REPO_NAME"
+          
+          # Set output for next steps
+          echo "archive-repo-url=https://github.com/$ARCHIVE_ORG/$TARGET_REPO_NAME" >> $GITHUB_OUTPUT
+
+      - name: Notify success
+        if: steps.archive-repo.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ARCHIVE_URL: ${{ steps.archive-repo.outputs.archive-repo-url }}
+          REPO_TO_DELETE: ${{ steps.issue.outputs.repo-to-delete }}
+        run: |
+          gh issue comment $ISSUE_NUMBER --body "✅ Repository archiving completed successfully!
+
+          The repository $REPO_TO_DELETE has been moved to the archive organization and marked as archived. You can find it at: $ARCHIVE_URL"
+          
+          gh issue close $ISSUE_NUMBER --comment "Repository archiving process completed."
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```yaml
 name: Repository Archive IssueOps
 
 on:
