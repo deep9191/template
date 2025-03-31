@@ -1,5 +1,86 @@
 ```yaml
 
+
+
+      - name: Get issue information
+        id: issue
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ steps.generate-test-token.outputs.token }}
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || '';
+            const title = issue.title || '';
+            
+            // Check if this is a delete/archive request
+            const deleteCommand = /^\/delete\s+(\S+)/m;
+            const match = body.match(deleteCommand) || title.match(deleteCommand);
+            
+            if (!match) {
+              // Check for comments if this is a comment event
+              if (context.payload.comment) {
+                const commentBody = context.payload.comment.body || '';
+                const commentMatch = commentBody.match(deleteCommand);
+                if (commentMatch) {
+                  const repoToDelete = commentMatch[1];
+                  core.setOutput('repo-to-delete', repoToDelete);
+                  
+                  // Add the repo-archive label to the issue
+                  try {
+                    await github.rest.issues.addLabels({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      labels: ['repo-archive']
+                    });
+                    console.log('Added repo-archive label to issue');
+                  } catch (error) {
+                    console.log(`Error adding label: ${error.message}`);
+                  }
+                  
+                  return repoToDelete;
+                }
+              }
+              
+              console.log('Not a delete request. Exiting.');
+              return core.setOutput('repo-to-delete', '');
+            }
+            
+            const repoToDelete = match[1];
+            core.setOutput('repo-to-delete', repoToDelete);
+            
+            // Add the repo-archive label to the issue
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: ['repo-archive']
+              });
+              console.log('Added repo-archive label to issue');
+            } catch (error) {
+              console.log(`Error adding label: ${error.message}`);
+              // Continue even if label addition fails
+            }
+            
+            return repoToDelete;
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```yaml
+
 name: Repository Archive and Recreate IssueOps
 
 on:
