@@ -206,4 +206,20 @@ A simple, reusable GitHub Action for sending email notifications with reports fr
 ## Usage
 
 Add this action to your workflow:
+
+## Input Parameters
+
+| Parameter | Description | Required | Default |
+|-----------|-------------|----------|---------|
+| `subject` | Email subject line | Yes | - |
+| `message` | Email message body (HTML supported) | Yes | - |
+| `recipients` | Comma-separated list of email recipients | Yes (if `recipient_group` not used) | - |
+| `recipient_group` | Name of recipient group from config file | Yes (if `recipients` not used) | - |
+| `reports_folder` | Path to the folder containing reports | Yes | `reports` |
+| `report_pattern` | File pattern to match reports | No | `*` (all files) |
+| `config_path` | Path to recipients config file | No | `.github/notification-config.yml` |
+
+## SMTP Configuration
+
+This action uses a centralized SMTP configuration that is managed within the action itself. You don't need to provide any SMTP credentials.
 ```
