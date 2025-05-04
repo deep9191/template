@@ -1,147 +1,209 @@
 ```yaml
 
-      - name: Process repository
-        if: steps.check-permissions.outputs.is-admin == 'true'
-        id: process-repo
-        env:
-          TEST_TOKEN: ${{ steps.generate-test-token.outputs.token }}
-          BANKING_TOKEN: ${{ steps.generate-banking-token.outputs.token }}
-          SOURCE_ORG: ${{ steps.check-permissions.outputs.org-name }}
-          REPO_NAME: ${{ steps.check-permissions.outputs.repo-name }}
-          BANKING_ORG: "DigitalBankingSolutions"  # Replace with your banking solutions org
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-        run: |
-          # Get current date in YYYYMMDD format
-          TODAY=$(date +"%Y%m%d")
+name: 'Email Notification for Reports'
+description: 'Send email notifications for reports in a specific folder using centralized SMTP configuration'
+inputs:
+  subject:
+    description: 'Email subject line'
+    required: true
+  message:
+    description: 'Email message body (HTML supported)'
+    required: true
+  recipients:
+    description: 'Comma-separated list of email recipients'
+    required: false
+  recipient_group:
+    description: 'Name of recipient group from config file'
+    required: false
+  reports_folder:
+    description: 'Path to the folder containing reports'
+    required: true
+    default: 'reports'
+  report_pattern:
+    description: 'File pattern to match reports (e.g., "*.txt" or "report-*.csv")'
+    required: false
+    default: '*'
+  config_path:
+    description: 'Path to recipients config file'
+    required: false
+    default: '.github/notification-config.yml'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Load Configuration
+      id: config
+      shell: bash
+      run: |
+        # Set SMTP configuration (hardcoded in the action)
+        echo "::set-output name=smtp_server::smtp.company.com"
+        echo "::set-output name=smtp_port::465"
+        echo "::set-output name=smtp_username::notifications@company.com"
+        echo "::set-output name=email_from::notifications@company.com"
+        
+        # The password is hardcoded in a secure way within the action
+        # This is a placeholder - in a real implementation, you would use a more secure approach
+        # such as GitHub's encrypted secrets at the organization level
+        SMTP_PASSWORD="your-secure-password-or-token"
+        echo "::set-output name=smtp_password::$SMTP_PASSWORD"
+    
+    - name: Resolve Recipients
+      id: resolve-recipients
+      shell: bash
+      run: |
+        FINAL_RECIPIENTS="${{ inputs.recipients }}"
+        
+        # If recipient_group is provided, try to extract from config file
+        if [[ -n "${{ inputs.recipient_group }}" && -f "${{ inputs.config_path }}" ]]; then
+          GROUP_RECIPIENTS=$(grep -A 20 "${{ inputs.recipient_group }}:" "${{ inputs.config_path }}" | grep -v "${{ inputs.recipient_group }}:" | grep -B 20 -m 1 "^[a-z]" | grep "@" | sed 's/[^@]*\(@.*\)/\1/g' | tr -d ' -' | tr '\n' ',')
           
-          # Get repository details before deleting
-          echo "Getting repository details for $SOURCE_ORG/$REPO_NAME"
-          # Use the test token for source org operations
-          export GITHUB_TOKEN=$TEST_TOKEN
-          
-          REPO_DESC=$(gh api repos/$SOURCE_ORG/$REPO_NAME --jq '.description // "Repository"')
-          REPO_PRIVATE=$(gh api repos/$SOURCE_ORG/$REPO_NAME --jq '.private')
-          REPO_TOPICS=$(gh api repos/$SOURCE_ORG/$REPO_NAME/topics --jq '.names | join(",")' || echo "")
-          REPO_HOMEPAGE=$(gh api repos/$SOURCE_ORG/$REPO_NAME --jq '.homepage // ""')
-          
-          # Set visibility flag for repo creation
-          if [[ "$REPO_PRIVATE" == "true" ]]; then
-            VISIBILITY="--private"
-          else
-            VISIBILITY="--public"
-          fi
-          
-          # Step 1: Create new repository in banking solutions org with date suffix
-          # Use banking token for banking org operations
-          export GITHUB_TOKEN=$BANKING_TOKEN
-          
-          NEW_REPO_NAME="${REPO_NAME}-${TODAY}"
-          echo "Creating new repository in banking solutions org: $BANKING_ORG/$NEW_REPO_NAME"
-          
-          # Create the repository
-          gh repo create $BANKING_ORG/$NEW_REPO_NAME $VISIBILITY --description "$REPO_DESC"
-          
-          # Set topics if any
-          if [[ ! -z "$REPO_TOPICS" ]]; then
-            echo "Setting topics: $REPO_TOPICS"
-            # Properly format the topics as a JSON array
-            if [[ "$REPO_TOPICS" == *","* ]]; then
-              # Multiple topics
-              FORMATTED_TOPICS="[\"$(echo $REPO_TOPICS | sed 's/,/\",\"/g')\"]"
-            elif [[ ! -z "$REPO_TOPICS" ]]; then
-              # Single topic
-              FORMATTED_TOPICS="[\"$REPO_TOPICS\"]"
+          if [[ -n "$GROUP_RECIPIENTS" ]]; then
+            if [[ -n "$FINAL_RECIPIENTS" ]]; then
+              FINAL_RECIPIENTS="$FINAL_RECIPIENTS,$GROUP_RECIPIENTS"
             else
-              # No topics
-              FORMATTED_TOPICS="[]"
+              FINAL_RECIPIENTS="$GROUP_RECIPIENTS"
             fi
-            echo "Formatted topics: $FORMATTED_TOPICS"
-            gh api -X PUT repos/$BANKING_ORG/$NEW_REPO_NAME/topics --input - <<EOF
-            {
-              "names": $FORMATTED_TOPICS
-            }
-EOF
           fi
-          
-          # Set homepage if any
-          if [[ ! -z "$REPO_HOMEPAGE" && "$REPO_HOMEPAGE" != "null" ]]; then
-            echo "Setting homepage: $REPO_HOMEPAGE"
-            gh api -X PATCH repos/$BANKING_ORG/$NEW_REPO_NAME -f homepage="$REPO_HOMEPAGE"
+        fi
+        
+        echo "::set-output name=email_list::$FINAL_RECIPIENTS"
+    
+    - name: Find Reports
+      id: find-reports
+      shell: bash
+      run: |
+        # Check if reports folder exists
+        if [ ! -d "${{ inputs.reports_folder }}" ]; then
+          echo "Error: Reports folder not found at ${{ inputs.reports_folder }}"
+          exit 1
+        fi
+        
+        # Find reports matching the pattern
+        REPORTS=$(find "${{ inputs.reports_folder }}" -type f -name "${{ inputs.report_pattern }}" | tr '\n' ',' | sed 's/,$//')
+        
+        if [ -z "$REPORTS" ]; then
+          echo "Error: No reports found matching pattern '${{ inputs.report_pattern }}' in folder '${{ inputs.reports_folder }}'"
+          exit 1
+        fi
+        
+        echo "Found reports: $REPORTS"
+        echo "::set-output name=report_list::$REPORTS"
+    
+    - name: Send Email
+      shell: bash
+      run: |
+        # Create a temporary file for the email content
+        EMAIL_FILE=$(mktemp)
+        
+        # Create email content with MIME parts
+        echo "From: ${{ steps.config.outputs.email_from }}" > $EMAIL_FILE
+        echo "To: ${{ steps.resolve-recipients.outputs.email_list }}" >> $EMAIL_FILE
+        echo "Subject: ${{ inputs.subject }}" >> $EMAIL_FILE
+        echo "MIME-Version: 1.0" >> $EMAIL_FILE
+        echo "Content-Type: multipart/mixed; boundary=\"boundary-string\"" >> $EMAIL_FILE
+        echo "" >> $EMAIL_FILE
+        echo "--boundary-string" >> $EMAIL_FILE
+        echo "Content-Type: text/html; charset=\"UTF-8\"" >> $EMAIL_FILE
+        echo "Content-Transfer-Encoding: 7bit" >> $EMAIL_FILE
+        echo "" >> $EMAIL_FILE
+        echo "${{ inputs.message }}" >> $EMAIL_FILE
+        
+        # Add each report as an attachment
+        IFS=',' read -ra REPORT_ARRAY <<< "${{ steps.find-reports.outputs.report_list }}"
+        for REPORT in "${REPORT_ARRAY[@]}"; do
+          if [ -f "$REPORT" ]; then
+            echo "--boundary-string" >> $EMAIL_FILE
+            echo "Content-Type: text/plain; charset=\"UTF-8\"" >> $EMAIL_FILE
+            echo "Content-Transfer-Encoding: base64" >> $EMAIL_FILE
+            echo "Content-Disposition: attachment; filename=\"$(basename $REPORT)\"" >> $EMAIL_FILE
+            echo "" >> $EMAIL_FILE
+            base64 -w 0 "$REPORT" >> $EMAIL_FILE
+            echo "" >> $EMAIL_FILE
           fi
-          
-          # Step 2: Clone the original repository
-          echo "Cloning repository: $SOURCE_ORG/$REPO_NAME"
-          export GITHUB_TOKEN=$TEST_TOKEN
-          git clone https://x-access-token:${GITHUB_TOKEN}@github.com/$SOURCE_ORG/$REPO_NAME.git source-repo
-          cd source-repo
-          
-          # Get all branches and tags
-          git fetch --all
-          git fetch --tags
-          
-          # Step 3: Push to the new repository with branch protection bypass
-          echo "Pushing data to new repository: $BANKING_ORG/$NEW_REPO_NAME"
-          export GITHUB_TOKEN=$BANKING_TOKEN
-          
-          # Add the new repository as a remote
-          git remote add banking https://x-access-token:${GITHUB_TOKEN}@github.com/$BANKING_ORG/$NEW_REPO_NAME.git
-          
-          # Get list of all branches
-          BRANCHES=$(git branch -r | grep -v '\->' | sed 's/origin\///')
-          
-          # Push each branch individually to the new repository
-          for branch in $BRANCHES; do
-            echo "Processing branch: $branch"
-            git checkout -b $branch origin/$branch || git checkout $branch
-            
-            # Check if this is a protected branch (main, master, develop)
-            if [[ "$branch" == "main" || "$branch" == "master" || "$branch" == "develop" ]]; then
-              echo "This is a protected branch: $branch"
-              # For protected branches, we'll use the admin token to bypass branch protection
-              # The --force flag bypasses branch protection rules when used with an admin token
-              git push banking $branch --force
-            else
-              # For non-protected branches, push normally
-              git push banking $branch
-            fi
-          done
-          
-          # Push all tags
-          git push banking --tags
-          
-          cd ..
-          
-          # Step 4: Delete the repository from test org
-          # Use test token for test org operations
-          export GITHUB_TOKEN=$TEST_TOKEN
-          
-          echo "Deleting repository from test org: $SOURCE_ORG/$REPO_NAME"
-          gh api -X DELETE /repos/$SOURCE_ORG/$REPO_NAME
-          
-          # Add comment to the issue
-          gh issue comment $ISSUE_NUMBER --body "Repository processing completed:
-          
-          - Original repo \`$SOURCE_ORG/$REPO_NAME\` has been deleted
-          - New repository created with all data at: https://github.com/$BANKING_ORG/$NEW_REPO_NAME"
-          
-          # Set outputs for next steps
-          echo "new-repo-url=https://github.com/$BANKING_ORG/$NEW_REPO_NAME" >> $GITHUB_OUTPUT
+        done
+        
+        echo "--boundary-string--" >> $EMAIL_FILE
+        
+        # Send email using curl and SMTP
+        curl --url "smtp://${{ steps.config.outputs.smtp_server }}:${{ steps.config.outputs.smtp_port }}" \
+          --ssl-reqd \
+          --mail-from "${{ steps.config.outputs.email_from }}" \
+          --mail-rcpt "${{ steps.resolve-recipients.outputs.email_list }}" \
+          --upload-file $EMAIL_FILE \
+          --user "${{ steps.config.outputs.smtp_username }}:${{ steps.config.outputs.smtp_password }}"
+        
+        # Clean up
+        rm $EMAIL_FILE
+
+
+```
+
+```yaml
+
+name: Process and Notify
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * 1-5'  # Weekdays at 9am
+
+jobs:
+  notify-from-reports:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+      
+      # The reports are assumed to already exist in the 'reports' folder
+      # This could be from a previous job, workflow, or commit
+      
+      - name: Send Email Notification
+        uses: ./.github/actions/email-notification
+        with:
+          subject: "Topics and BUC Issues Detected"
+          message: "The automated check has detected issues with Topics and BUC. Please review the attached reports."
+          recipient_group: "otop-team"
+          reports_folder: "reports"
+          report_pattern: "*.txt"  # Send all text files in the reports folder
+
+
+```
+
+```yaml
+
+# Notification Configuration
+
+# Recipient Groups
+recipientGroups:
+  otop-team:
+    - user1@example.com
+    - user2@example.com
+  security-team:
+    - security-lead@example.com
+    - security-analyst@example.com
+  admin-team:
+    - admin@example.com
+    - manager@example.com
+
 ```
 
 
-```yaml
-      - name: Notify success
-        if: steps.process-repo.outcome == 'success'
-        env:
-          GITHUB_TOKEN: ${{ steps.generate-test-token.outputs.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          NEW_REPO_URL: ${{ steps.process-repo.outputs.new-repo-url }}
-          REPO_TO_DELETE: ${{ steps.issue.outputs.repo-to-delete }}
-        run: |
-          gh issue comment $ISSUE_NUMBER --body "✅ Repository processing completed successfully!
+```
+# GitHub Email Notification Action for Reports
 
-          - Original repository \`$REPO_TO_DELETE\` has been deleted
-          - New repository has been created with all data at: $NEW_REPO_URL"
-          
-          gh issue close $ISSUE_NUMBER --comment "Repository deletion and recreation process completed."
+A simple, reusable GitHub Action for sending email notifications with reports from a specific folder. This action uses a centralized SMTP configuration so you don't need to provide these details each time.
+
+## Features
+
+- Send HTML email notifications
+- Automatically attaches reports from a specified folder
+- Supports file pattern matching to select specific reports
+- No third-party dependencies
+- Simple to use and integrate
+- Supports recipient groups from a configuration file
+- Centralized SMTP configuration - no need to provide SMTP credentials
+
+## Usage
+
+Add this action to your workflow:
 ```
