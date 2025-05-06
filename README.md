@@ -1,5 +1,163 @@
 ```yaml
 
+name: 'GitHub Native Notification'
+description: 'Send notifications to team members using GitHub repository features'
+inputs:
+  team:
+    description: 'Team name from config or comma-separated GitHub usernames'
+    required: true
+  message:
+    description: 'Notification message'
+    required: true
+  report_path:
+    description: 'Path to report file in the repository'
+    required: false
+  config_path:
+    description: 'Path to notification config file in the repository'
+    required: false
+    default: '.github/notification-config.yml'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Create notification
+      shell: bash
+      run: |
+        # Determine recipients
+        TEAM="${{ inputs.team }}"
+        CONFIG_PATH="${{ inputs.config_path }}"
+        RECIPIENTS=""
+        
+        # Check if team name exists in config
+        if [ -f "$CONFIG_PATH" ]; then
+          # Extract team members if team exists in config
+          if grep -q "^  $TEAM:" "$CONFIG_PATH"; then
+            TEAM_MEMBERS=$(sed -n "/^  $TEAM:/,/^  [a-z]/ p" "$CONFIG_PATH" | grep "^    -" | sed 's/^    - //')
+            for member in $TEAM_MEMBERS; do
+              RECIPIENTS+="$member,"
+            done
+            RECIPIENTS=${RECIPIENTS%,}  # Remove trailing comma
+          else
+            # If not found in config, use input as direct usernames
+            RECIPIENTS="$TEAM"
+          fi
+        else
+          # If config doesn't exist, use input as direct usernames
+          RECIPIENTS="$TEAM"
+        fi
+        
+        # Create notification content with @mentions
+        NOTIFICATION=""
+        
+        # Add @mentions for each recipient
+        IFS=',' read -ra USERS <<< "$RECIPIENTS"
+        for user in "${USERS[@]}"; do
+          NOTIFICATION+="@${user//[[:space:]]/} "
+        done
+        
+        NOTIFICATION+="\n\n${{ inputs.message }}"
+        
+        # Add report link if provided
+        if [ -n "${{ inputs.report_path }}" ] && [ -f "${{ inputs.report_path }}" ]; then
+          REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          REPORT_URL="${REPO_URL}/blob/${BRANCH}/${{ inputs.report_path }}"
+          
+          NOTIFICATION+="\n\n## Report\n[View Report: ${{ inputs.report_path }}](${REPORT_URL})"
+        fi
+        
+        # Create a comment on the commit with the notification
+        gh api \
+          --method POST \
+          -H "Accept: application/vnd.github+json" \
+          /repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/comments \
+          -f body="${NOTIFICATION}"
+        
+        echo "Notification posted as commit comment"
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+
+```
+
+```yaml
+# Team member GitHub usernames
+teams:
+  otop-team:
+    - user1
+    - user2
+    - user3
+  
+  dev-team:
+    - dev-lead
+    - developer1
+    - developer2
+```
+
+```yaml
+name: Process and Notify
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      # Generate or process report
+      
+      - name: Send notification
+        uses: ./.github/actions/github-notification
+        # Or if published to a central repository:
+        # uses: your-org/github-notification-action@v1
+        with:
+          team: 'otop-team'
+          message: 'Topics and BUC issues have been detected that require human validation or correction.'
+          report_path: './reports/issue-report.md'
+          # config_path: '.github/custom-notification-config.yml'  # Optional override
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+===========================================================================================================================================
+
+```yaml
+
 name: 'Email Notification for Reports'
 description: 'Send email notifications for reports in a specific folder using centralized SMTP configuration'
 inputs:
