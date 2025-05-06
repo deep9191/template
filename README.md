@@ -1,4 +1,106 @@
 ```yaml
+
+name: 'GitHub Native Notification'
+description: 'Send notifications to team members using GitHub repository features'
+inputs:
+  team:
+    description: 'Team name from config or comma-separated GitHub usernames'
+    required: true
+  message:
+    description: 'Notification message'
+    required: true
+  report_path:
+    description: 'Path to report file in the repository'
+    required: false
+  config_path:
+    description: 'Path to notification config file in the repository'
+    required: false
+    default: '.github/notification-config.yml'
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: actions/checkout@v2
+    
+    - name: Debug report file
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.report_path }}" ]; then
+          echo "Report path: ${{ inputs.report_path }}"
+          ls -la $(dirname "${{ inputs.report_path }}" || echo ".")
+          echo "File exists: $([ -f "${{ inputs.report_path }}" ] && echo 'Yes' || echo 'No')"
+        else
+          echo "No report path provided"
+        fi
+        
+    - name: Create notification
+      shell: bash
+      run: |
+        # Determine recipients
+        TEAM="${{ inputs.team }}"
+        CONFIG_PATH="${{ inputs.config_path }}"
+        RECIPIENTS=""
+        
+        # Check if team name exists in config
+        if [ -f "$CONFIG_PATH" ]; then
+          # Extract team members if team exists in config
+          if grep -q "^  $TEAM:" "$CONFIG_PATH"; then
+            TEAM_MEMBERS=$(sed -n "/^  $TEAM:/,/^  [a-z]/ p" "$CONFIG_PATH" | grep "^    -" | sed 's/^    - //')
+            for member in $TEAM_MEMBERS; do
+              RECIPIENTS+="$member,"
+            done
+            RECIPIENTS=${RECIPIENTS%,}  # Remove trailing comma
+          else
+            # If not found in config, use input as direct usernames
+            RECIPIENTS="$TEAM"
+          fi
+        else
+          # If config doesn't exist, use input as direct usernames
+          RECIPIENTS="$TEAM"
+        fi
+        
+        # Create notification content with @mentions
+        NOTIFICATION=""
+        
+        # Add @mentions for each recipient
+        IFS=',' read -ra USERS <<< "$RECIPIENTS"
+        for user in "${USERS[@]}"; do
+          NOTIFICATION+="@${user//[[:space:]]/} "
+        done
+        
+        NOTIFICATION+="\n\n${{ inputs.message }}"
+        
+        # Add report link if provided
+        if [ -n "${{ inputs.report_path }}" ]; then
+          REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          REPORT_URL="${REPO_URL}/blob/${BRANCH}/${{ inputs.report_path }}"
+          
+          if [ -f "${{ inputs.report_path }}" ]; then
+            echo "Report file exists, adding link"
+          else
+            echo "Report file not found at ${{ inputs.report_path }}, but still adding link"
+          fi
+          
+          NOTIFICATION+="\n\n## Report\n[View Report: ${{ inputs.report_path }}](${REPORT_URL})"
+        fi
+        
+        # Create a comment on the commit with the notification
+        gh api \
+          --method POST \
+          -H "Accept: application/vnd.github+json" \
+          /repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/comments \
+          -f body="${NOTIFICATION}"
+        
+        echo "Notification posted as commit comment"
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+```
+
+
+
+
+```yaml
 - name: Send notification
      uses: ./.github/actions/github-notification
      with:
