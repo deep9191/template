@@ -1,4 +1,15 @@
 ```yaml
+- name: Send notification
+     uses: ./.github/actions/github-notification
+     with:
+       team: 'otop-team'  # Team name from config or direct usernames
+       message: 'Your notification message'
+       report_path: 'path/to/report.md'  # Optional
+
+```
+
+
+```yaml
 
 name: 'GitHub Native Notification'
 description: 'Send notifications to team members using GitHub repository features'
